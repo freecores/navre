@@ -55,7 +55,9 @@ reg pop;
 always @(posedge clk) begin
 	if(rst) begin
 		io_sp <= 8'd0;
+`ifndef REGRESS
 		SP <= 16'd0;
+`endif
 	end else begin
 		io_sp <= io_a[0] ? SP[7:0] : SP[15:8];
 		if((io_a == 6'b111101) | (io_a == 6'b111110)) begin
@@ -96,7 +98,8 @@ end
 /* Register operations */
 wire immediate = (pmem_d[14]
 	| (pmem_d[15:12] == 4'b0011))		/* CPI */
-	& (pmem_d[15:10] != 6'b111111);		/* SBRC - SBRS */
+	& (pmem_d[15:10] != 6'b111111)		/* SBRC - SBRS */
+	& (pmem_d[15:10] != 6'b111110);		/* BST - BLD */
 reg lpm_en;
 wire [4:0] Rd = lpm_en ? 5'd0 : {immediate | pmem_d[8], pmem_d[7:4]};
 wire [4:0] Rr = {pmem_d[9], pmem_d[3:0]};
@@ -172,11 +175,13 @@ parameter PC_SEL_KS		= 4'd3;
 parameter PC_SEL_DMEML		= 4'd4;
 parameter PC_SEL_DMEMH		= 4'd6;
 parameter PC_SEL_DEC		= 4'd7;
-parameter PC_SEL_Z		= 4'd7;
+parameter PC_SEL_Z		= 4'd8;
 
 always @(posedge clk) begin
 	if(rst) begin
+`ifndef REGRESS
 		PC <= 0;
+`endif
 	end else begin
 		case(pc_sel)
 			PC_SEL_NOP:;
@@ -192,7 +197,13 @@ always @(posedge clk) begin
 	end
 end
 reg pmem_selz;
-assign pmem_a = rst ? 0 : (pmem_selz ? pZ[15:1] : PC + 1);
+assign pmem_a = rst ?
+`ifdef REGRESS
+	PC
+`else
+	0
+`endif
+	: (pmem_selz ? pZ[15:1] : PC + 1);
 
 /* Load/store operations */
 reg [3:0] dmem_sel;
@@ -225,15 +236,18 @@ integer i_rst_regf;
 reg [7:0] R;
 reg writeback;
 reg update_nsz;
+reg change_z;
 reg [15:0] R16;
 reg mode16;
 always @(posedge clk) begin
 	R = 8'hxx;
 	writeback = 1'b0;
 	update_nsz = 1'b0;
+	change_z = 1'b1;
 	R16 = 16'hxxxx;
 	mode16 = 1'b0;
 	if(rst) begin
+`ifndef REGRESS
 		/*
 		 * Not resetting the register file enables the use of more efficient
 		 * distributed block RAM.
@@ -253,6 +267,7 @@ always @(posedge clk) begin
 		N = 1'b0;
 		Z = 1'b0;
 		C = 1'b0;
+`endif
 	end else begin
 		if(normal_en) begin
 			writeback = 1'b1;
@@ -270,6 +285,8 @@ always @(posedge clk) begin
 					{C, R} = GPR_Rd - GPR_Rr - (~pmem_d[12] & C);
 					H = (~GPR_Rd[3] & GPR_Rr[3])|(GPR_Rr[3] & R[3])|(R[3] & ~GPR_Rd[3]);
 					V = (GPR_Rd[7] & ~GPR_Rr[7] & ~R[7])|(~GPR_Rd[7] & GPR_Rr[7] & R[7]);
+					if(~pmem_d[12])
+						change_z = 1'b0;
 					writeback = pmem_d[11];
 				end
 				16'b010x_xxxx_xxxx_xxxx, /* subtract */
@@ -278,6 +295,8 @@ always @(posedge clk) begin
 					{C, R} = GPR_Rd - K - (~pmem_d[12] & C);
 					H = (~GPR_Rd[3] & K[3])|(K[3] & R[3])|(R[3] & ~GPR_Rd[3]);
 					V = (GPR_Rd[7] & ~K[7] & ~R[7])|(~GPR_Rd[7] & K[7] & R[7]);
+					if(~pmem_d[12])
+						change_z = 1'b0;
 					writeback = pmem_d[14];
 				end
 				16'b0010_00xx_xxxx_xxxx: begin
@@ -392,7 +411,7 @@ always @(posedge clk) begin
 				end
 				/* LSL is replaced with ADD */
 				/* ROL is replaced with ADC */
-				16'b1111_10xx_xxxx_xxxx: begin
+				16'b1111_10xx_xxxx_0xxx: begin
 					if(pmem_d[9]) begin
 						/* BST */
 						T = GPR_Rd_b;
@@ -459,7 +478,7 @@ always @(posedge clk) begin
 		if(update_nsz) begin
 			N = mode16 ? R16[15] : R[7];
 			S = N ^ V;
-			Z = mode16 ? R16 == 16'h0000 : R == 8'h00;
+			Z = mode16 ? R16 == 16'h0000 : ((R == 8'h00) & (change_z|Z));
 		end
 		if(io_we & (io_a == 6'b111111))
 			{T, H, S, V, N, Z, C} = io_do[6:0];
@@ -501,7 +520,7 @@ always @(posedge clk) begin
 				default:;
 			endcase
 		end
-	end /* if(sys_rst) ... else */
+	end /* if(rst) ... else */
 end
 
 /* I/O port */
@@ -532,9 +551,12 @@ wire [pmem_width-1:0] PC_inc = PC + 1;
 always @(*) begin
 	case(dmem_sel)
 		DMEM_SEL_X,
+		DMEM_SEL_XPLUS,
 		DMEM_SEL_XMINUS,
+		DMEM_SEL_YPLUS,
 		DMEM_SEL_YMINUS,
 		DMEM_SEL_YQ,
+		DMEM_SEL_ZPLUS,
 		DMEM_SEL_ZMINUS,
 		DMEM_SEL_ZQ,
 		DMEM_SEL_SP_R:		dmem_do = GPR_Rd;
@@ -633,7 +655,7 @@ always @(*) begin
 					if(reg_equal)
 						next_state = SKIP;
 				end
-				16'b1111_11xx_xxxx_xxxx: begin
+				16'b1111_11xx_xxxx_0xxx: begin
 					/* SBRC - SBRS */
 					pc_sel = PC_SEL_INC;
 					pmem_ce = 1'b1;
@@ -803,7 +825,6 @@ always @(*) begin
 		LDS2: begin
 			pc_sel = PC_SEL_INC;
 			pmem_ce = 1'b1;
-			normal_en = 1'b1;
 			lds_writeback = 1'b1;
 			next_state = NORMAL;
 		end
@@ -829,5 +850,50 @@ always @(*) begin
 		end
 	endcase
 end
+
+`ifdef REGRESS
+integer i;
+integer cycles;
+always @(posedge clk) begin
+	if(~rst & (state == NORMAL) & (cycles != 0)) begin
+		$display("DUMP REGISTERS");
+		for(i=0;i<24;i=i+1)
+			$display("%x", GPR[i]);
+		$display("%x", U[7:0]);
+		$display("%x", U[15:8]);
+		$display("%x", pX[7:0]);
+		$display("%x", pX[15:8]);
+		$display("%x", pY[7:0]);
+		$display("%x", pY[15:8]);
+		$display("%x", pZ[7:0]);
+		$display("%x", pZ[15:8]);
+		$display("%x", {1'b0, T, H, S, V, N, Z, C});
+		$display("%x", SP[15:8]);
+		$display("%x", SP[7:0]);
+		$display("%x", PC[14:7]);
+		$display("%x", {PC[6:0], 1'b0});
+		tb_regress.dump;
+		$finish;
+	end
+	if(rst)
+		cycles = 0;
+	else
+		cycles = cycles + 1;
+end
+
+reg [7:0] SPR[0:12];
+reg I;
+initial begin
+	$readmemh("gpr.rom", GPR);
+	$readmemh("spr.rom", SPR);
+	U = {SPR[1], SPR[0]};
+	pX = {SPR[3], SPR[2]};
+	pY = {SPR[5], SPR[4]};
+	pZ = {SPR[7], SPR[6]};
+	{I, T, H, S, V, N, Z, C} = SPR[8];
+	SP = {SPR[9], SPR[10]};
+	PC = {SPR[11], SPR[12]}/2;
+end
+`endif
 
 endmodule
